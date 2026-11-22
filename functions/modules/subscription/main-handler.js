@@ -48,6 +48,7 @@ import {
     renderSingboxFromIniTemplate,
     renderSurgeFromIniTemplate,
 } from './template-pipeline.js';
+import { handleProfileMode } from './profile-handler.js';
 import { getBuiltinTemplate } from './builtin-template-registry.js';
 import { assertPublicNetworkUrl } from '../security-utils.js';
 
@@ -513,6 +514,55 @@ export function resolveBuiltinRequestOptions({ searchParams, userAgent = '' } = 
     };
 }
 
+/**
+ * 解析 profile 生效的 nodeTransform（订阅组 > 预设 > 全局）。
+ *
+ * 与 refreshNodes 闭包内的回退链保持一致，供闭包外的 builtinOptions 复用。
+ * 闭包内的 effectiveNodeTransform 无法外泄，而 builtinOptions 在闭包外构造，
+ * 因此需要独立解析一次。
+ *
+ * @param {Object|null} profile - 当前订阅组
+ * @param {Object} config - 全局设置
+ * @returns {Object} 生效的 nodeTransform（可能为空对象）
+ */
+export function resolveEffectiveNodeTransform(profile, config = {}) {
+    const globalNodeTransform = config.defaultNodeTransform || {};
+    const presets = Array.isArray(config.nodeTransformPresets) ? config.nodeTransformPresets : [];
+    const profileNodeTransform = profile?.nodeTransform ?? null;
+    const presetId = profile?.nodeTransformPresetId || '';
+    const presetNodeTransform = presetId
+        ? presets.find((item) => item?.id === presetId)?.config
+        : null;
+    const hasProfileNodeTransform =
+        profileNodeTransform && Object.keys(profileNodeTransform).length > 0;
+
+    // 整体覆盖逻辑，与 refreshNodes 内一致
+    return hasProfileNodeTransform
+        ? profileNodeTransform
+        : presetNodeTransform || globalNodeTransform;
+}
+
+/**
+ * 解析内置生成器应使用的 addFlagEmoji 开关。
+ *
+ * 优先级与 subscription-service 的 shouldKeepEmoji 一致：
+ *   nodeTransform.addFlagEmoji（true/false） > config.enableFlagEmoji > 默认 true
+ *
+ * 返回 undefined 表示两边都没显式配置，保持 url-to-clash.js 的默认行为（加国旗）。
+ *
+ * @param {Object|null} profile - 当前订阅组
+ * @param {Object} config - 全局设置
+ * @returns {boolean|undefined}
+ */
+export function resolveAddFlagEmoji(profile, config = {}) {
+    const explicit = resolveEffectiveNodeTransform(profile, config).addFlagEmoji;
+    if (explicit === true || explicit === false) return explicit;
+    if (config.enableFlagEmoji === true || config.enableFlagEmoji === false) {
+        return config.enableFlagEmoji;
+    }
+    return undefined;
+}
+
 export function shouldRenderClashYamlProfileTemplateLocally({
     isExternalMode = false,
     targetFormat = '',
@@ -613,6 +663,26 @@ export async function handleMisubRequest(context) {
     const DEFAULT_EXPIRED_NODE = `trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:443#${encodeURIComponent('您的订阅已到期')}`;
 
     let currentProfile = null;
+    let isExternalMode = false;
+    let useBuiltin = true;
+    let shouldSkipCertificateVerify = false;
+    let shouldEnableUdp = true;
+
+    const initEngineFlags = (targetProf) => {
+        const profileSub = targetProf?.subconverter || {};
+        const globalSub = config.subconverter || {};
+        const effectiveEngine = resolveEffectiveEngine({
+            searchParams: url.searchParams,
+            userAgent: userAgentHeader,
+            profileEngineMode: profileSub.engineMode,
+            globalEngineMode: globalSub.engineMode,
+        });
+        isExternalMode = effectiveEngine === 'external';
+        useBuiltin = !isExternalMode;
+        const flags = resolveBuiltinEngineFlags(config, isExternalMode);
+        shouldSkipCertificateVerify = flags.shouldSkipCertificateVerify;
+        shouldEnableUdp = flags.shouldEnableUdp;
+    };
 
     if (profileIdentifier) {
         // [修正] 使用 config 變量
@@ -628,6 +698,7 @@ export async function handleMisubRequest(context) {
         currentProfile = allProfiles.find(
             (p) => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier
         );
+        initEngineFlags(currentProfile);
         const profile = currentProfile;
         if (profile && profile.enabled) {
             // Check if the profile has an expiration date and if it's expired
@@ -705,6 +776,49 @@ export async function handleMisubRequest(context) {
                         }
                     });
                 }
+
+                // 3. Add sub-profiles in order defined by profile (嵌套组合订阅)
+                const profileSubProfileIds = profile.subProfiles || [];
+                if (Array.isArray(profileSubProfileIds) && profileSubProfileIds.length > 0) {
+                    for (const subProfileId of profileSubProfileIds) {
+                        if (
+                            !subProfileId ||
+                            subProfileId === profile.id ||
+                            subProfileId === profile.customId
+                        ) {
+                            continue;
+                        }
+                        try {
+                            const subResult = await handleProfileMode(
+                                request,
+                                env,
+                                subProfileId,
+                                userAgentHeader,
+                                true,
+                                shouldSkipCertificateVerify,
+                                1,
+                                new Set([profile.id, profile.customId].filter(Boolean))
+                            );
+                            if (subResult.success && Array.isArray(subResult.nodes)) {
+                                subResult.nodes.forEach((node) => {
+                                    targetMisubs.push({
+                                        id: `nested-${subProfileId}-${node.url}`,
+                                        name: node.name,
+                                        url: node.url,
+                                        group: subResult.profileName || '组合订阅',
+                                        isFromSubProfile: true,
+                                        enabled: true,
+                                    });
+                                });
+                            }
+                        } catch (err) {
+                            console.error(
+                                `[MainHandler] Failed to resolve sub-profile ${subProfileId}:`,
+                                err
+                            );
+                        }
+                    }
+                }
             }
             // [新增] 增加订阅组下载计数
             // 仅在非回调请求时及非内部请求时增加计数(避免重复计数)
@@ -742,6 +856,7 @@ export async function handleMisubRequest(context) {
             );
         }
         targetMisubs = allMisubs.filter((s) => s.enabled);
+        initEngineFlags(null);
     }
 
     // 使用统一的确定目标格式的方法（此方法中包含了处理各类客户端如 Surge 等对应版本的最新支持规则）
@@ -798,23 +913,8 @@ export async function handleMisubRequest(context) {
         }
     }
 
-    // [Subconverter Engine Selection] Priority: URL Parameter > Profile Settings > Global Settings
     const profileSub = currentProfile?.subconverter || {};
     const globalSub = config.subconverter || {};
-
-    // [Optimization] Respect user defined engine mode while preventing loops for non-browser agents (backend fetchers)
-    const effectiveEngine = resolveEffectiveEngine({
-        searchParams: url.searchParams,
-        userAgent: userAgentHeader,
-        profileEngineMode: profileSub.engineMode,
-        globalEngineMode: globalSub.engineMode,
-    });
-    const isExternalMode = effectiveEngine === 'external';
-    const useBuiltin = !isExternalMode;
-    const { shouldSkipCertificateVerify, shouldEnableUdp } = resolveBuiltinEngineFlags(
-        config,
-        isExternalMode
-    );
 
     const globalTemplateUrl = resolveTemplateUrl(
         config.transformConfigMode,
@@ -1123,6 +1223,9 @@ export async function handleMisubRequest(context) {
                         searchParams: url.searchParams,
                         userAgent: userAgentHeader,
                     }),
+                    // 透传 emoji 开关到内置生成器（url-to-clash.js 读 options.addFlagEmoji）。
+                    // 漏传时 `undefined !== false` 恒为 true，导致无条件加国旗。
+                    addFlagEmoji: resolveAddFlagEmoji(currentProfile, config),
                     fileName: subName,
                     managedConfigUrl: buildManagedConfigUrl(request.url),
                     interval: config.UpdateInterval || 86400,
@@ -1294,6 +1397,9 @@ export async function handleMisubRequest(context) {
             searchParams: url.searchParams,
             userAgent: userAgentHeader,
         }),
+        // 透传 emoji 开关到内置生成器（url-to-clash.js 读 options.addFlagEmoji）。
+        // 漏传时 `undefined !== false` 恒为 true，导致无条件加国旗。
+        addFlagEmoji: resolveAddFlagEmoji(currentProfile, config),
         fileName: subName,
         managedConfigUrl: '',
         interval: config.UpdateInterval || 86400,
